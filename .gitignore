@@ -1,0 +1,43 @@
+# Binaries
+bin/
+pkc
+*.exe
+
+# Environment and secrets
+.env
+.env.*
+
+# Logs and generated output
+*.log
+response.html
+successful_emails.txt
+emails.txt
+proxies.txt
+
+# Charles proxy captures
+*.chlz
+*.har
+
+# Extracted website files
+www.pokemoncenter.com/
+*.zip
+
+# IDE and editor files
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.test
+coverage.out
+
+# Captures and reference data
+captures/
+docs/
