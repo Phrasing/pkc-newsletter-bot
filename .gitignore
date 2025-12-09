@@ -6,6 +6,8 @@ pkc
 # Environment and secrets
 .env
 .env.*
+.venv
+.claude
 
 # Logs and generated output
 *.log
