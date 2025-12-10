@@ -9,7 +9,7 @@ import (
 const (
 	Chrome143UserAgent       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
 	Chrome143SecChUa         = `"Google Chrome";v="143", "Chromium";v="143", "Not A(Brand";v="24"`
-	Chrome143FullVersionList = `"Google Chrome";v="143.0.0.0", "Chromium";v="143.0.0.0", "Not A(Brand";v="24.0.0.0"`
+	Chrome143FullVersionList = `"Google Chrome";v="143.0.7499.41", "Chromium";v="143.0.7499.41", "Not A(Brand";v="24.0.0.0"`
 )
 
 // Chrome143Profile is the browser profile for Chrome 143.
