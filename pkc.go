@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/url"
 	"strings"
 	"time"
@@ -18,46 +19,49 @@ import (
 )
 
 const (
-	// PKC URLs
-	pkcBaseURL        = "https://www.pokemoncenter.com"
-	pkcHomeURL        = pkcBaseURL + "/"
-	pkcCartDataURL    = pkcBaseURL + "/tpci-ecommweb-api/cart/data?type=mini"
-	pkcProfileDataURL = pkcBaseURL + "/tpci-ecommweb-api/profile/data?checkRole=true"
-	pkcEmailSignupURL = pkcBaseURL + "/tpci-ecommweb-api/email/signup"
+	pkcBaseURL           = "https://www.pokemoncenter.com"
+	pkcHomeURL           = pkcBaseURL + "/"
+	pkcCartDataURL       = pkcBaseURL + "/tpci-ecommweb-api/cart/data?type=mini"
+	pkcProfileDataURL    = pkcBaseURL + "/tpci-ecommweb-api/profile/data?checkRole=true"
+	pkcEmailSignupURL    = pkcBaseURL + "/tpci-ecommweb-api/email/signup"
+	pkcRecaptchaSiteKey  = "6Lc4P0MoAAAAAAhyCYBhoVfHZUF3HMvFdXSRZ-kO"
+	pkcRecaptchaMinScore = 0.7
+	pkcReese84ScriptPath = "/vice-come-Soldenyson-it-non-Banquoh-Chare-Hart-C"
 
-	// reCAPTCHA sitekey for email signup
-	pkcRecaptchaSiteKey = "6Lc4P0MoAAAAAAhyCYBhoVfHZUF3HMvFdXSRZ-kO"
+	pkcUseTwoCaptcha  = true
+	pkcUseCapmonster  = false
+	pkcUseCapsolver   = false
+	pkcEnableTracking = false
 
-	// maxChallengeRetries limits recursive challenge solving to prevent infinite loops
-	maxChallengeRetries = 3
-
-	// maxSignupProxyRetries limits proxy rotation retries for connection errors during signup
-	maxSignupProxyRetries = 5
-
-	// maxCaptchaRetries limits captcha token retries for identity-based policy denials
-	maxCaptchaRetries = 5
+	maxProxyRetries        = 5
+	maxChallengeRetries    = 3
+	captchaRotateThreshold = 5
+	maxSessionRotations    = 5
 )
 
-// PKCClient wraps the HTTP client with Pokemon Center specific functionality.
 type PKCClient struct {
 	client       tls_client.HttpClient
 	session      *hyper.Session
 	logger       Logger
-	externalIP   string         // Cached external IP for the proxy
-	headers      *hyper.Headers // Headers returned from Hyper API (sec-ch-ua-full-version-list, etc.)
-	proxy        string         // Proxy in CapSolver format (http://user:pass@ip:port)
-	proxyManager *ProxyManager  // Optional proxy manager for rotation
+	externalIP   string
+	headers      *hyper.Headers
+	proxy        string
+	proxyManager *ProxyManager
 	profile      *BrowserProfile
-	tagsSent     bool // Whether DataDome tags have been sent this session
+	tagsSent     bool
+
+	reese84Challenges   int
+	ddInterstitials     int
+	ddJSONChallenges    int
+	ddFingerprintBlocks int
+	sessionRotations    int
+	proxyRotations      int
 }
 
-// NewPKCClient creates a new Pokemon Center client with the default browser profile.
-// proxy should be in CapSolver format: http://user:pass@ip:port
 func NewPKCClient(client tls_client.HttpClient, session *hyper.Session, logger Logger, proxy string) *PKCClient {
 	return NewPKCClientWithProfile(client, session, logger, proxy, DefaultProfile)
 }
 
-// NewPKCClientWithProfile creates a new Pokemon Center client with a specific browser profile.
 func NewPKCClientWithProfile(client tls_client.HttpClient, session *hyper.Session, logger Logger, proxy string, profile *BrowserProfile) *PKCClient {
 	return &PKCClient{
 		client:  client,
@@ -68,15 +72,10 @@ func NewPKCClientWithProfile(client tls_client.HttpClient, session *hyper.Sessio
 	}
 }
 
-// SetProxyManager sets the proxy manager for rotation support.
 func (p *PKCClient) SetProxyManager(pm *ProxyManager) {
 	p.proxyManager = pm
 }
 
-// RotateProxy switches to the next proxy without recreating the client.
-// Uses SetProxy() to change proxy on existing client, preserving cookies and session.
-// Use this for connection-based errors where the session is still valid.
-// Returns true if rotation succeeded.
 func (p *PKCClient) RotateProxy() bool {
 	if p.proxyManager == nil {
 		return false
@@ -84,20 +83,17 @@ func (p *PKCClient) RotateProxy() bool {
 
 	newProxy := p.proxyManager.Rotate()
 	if err := p.client.SetProxy(newProxy); err != nil {
-		p.logger.Log("Failed to set new proxy: %v", err)
+		p.logger.Log("[SESSION] Proxy rotation FAILED: %v", err)
 		return false
 	}
 
 	p.proxy = newProxy
-	p.externalIP = "" // Clear cached IP since proxy changed
-	p.logger.Log("Rotated proxy: %s", p.proxyManager.CurrentDisplay())
+	p.externalIP = ""
+	p.proxyRotations++
+	p.logger.Log("[SESSION] Proxy rotated (total: %d) -> %s", p.proxyRotations, p.proxyManager.CurrentDisplay())
 	return true
 }
 
-// RotateSession switches to a new proxy and recreates the HTTP client and session.
-// Clears all state (cookies, session, headers). Use for non-connection errors
-// like fingerprint blocks or challenges that require a fresh start.
-// Returns true if rotation succeeded.
 func (p *PKCClient) RotateSession() bool {
 	if p.proxyManager == nil {
 		return false
@@ -106,22 +102,21 @@ func (p *PKCClient) RotateSession() bool {
 	newProxy := p.proxyManager.Rotate()
 	newClient, err := NewClient(nil, newProxy)
 	if err != nil {
-		p.logger.Log("Failed to create client with new proxy: %v", err)
+		p.logger.Log("[SESSION] Session rotation FAILED: %v", err)
 		return false
 	}
 
 	p.client = newClient
 	p.proxy = newProxy
-	p.externalIP = ""             // Clear cached IP
-	p.session = NewHyperSession() // Reset session
-	p.headers = nil               // Clear cached headers
-	p.tagsSent = false            // Reset tags flag
-	p.logger.Log("Rotated session: %s", p.proxyManager.CurrentDisplay())
+	p.externalIP = ""
+	p.session = NewHyperSession()
+	p.headers = nil
+	p.tagsSent = false
+	p.sessionRotations++
+	p.logger.Log("[SESSION] Full session rotated (total: %d) -> %s", p.sessionRotations, p.proxyManager.CurrentDisplay())
 	return true
 }
 
-// ResetSession creates a fresh Hyper session.
-// Call this when encountering session-related errors like "malformed device link".
 func (p *PKCClient) ResetSession() {
 	p.session = NewHyperSession()
 	p.headers = nil
@@ -129,8 +124,24 @@ func (p *PKCClient) ResetSession() {
 	p.tagsSent = false
 }
 
-// doRequest executes an HTTP request and logs the request URL and response status code.
-// This provides basic request/response logging for all HTTP calls.
+func (p *PKCClient) ReinitializeSession(ctx context.Context) error {
+	if !p.RotateSession() {
+		return fmt.Errorf("session rotation failed (no proxy manager)")
+	}
+
+	p.reese84Challenges = 0
+	p.ddInterstitials = 0
+	p.ddJSONChallenges = 0
+	p.ddFingerprintBlocks = 0
+
+	p.logger.Log("[SESSION] Reinitializing new session...")
+	if err := p.InitializeSession(ctx); err != nil {
+		return fmt.Errorf("session init failed after rotation: %w", err)
+	}
+
+	return nil
+}
+
 func (p *PKCClient) doRequest(req *http.Request) (*http.Response, error) {
 	resp, err := p.client.Do(req)
 	if err != nil {
@@ -141,58 +152,86 @@ func (p *PKCClient) doRequest(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
-// InitializeSession proactively sets up the session by generating Reese84 sensor
-// and submitting DataDome tags. This should be called before making any other requests.
 func (p *PKCClient) InitializeSession(ctx context.Context) error {
-	// Get external IP
-	ip, err := getExternalIP(p.client, p.session.ApiKey)
+	p.logger.Log("[INIT] proxy=%s", p.proxyManager.CurrentDisplay())
+
+	p.logger.Log("[INIT] [1/5] Resolving external IP...")
+	ip, err := getExternalIP(p.proxy, p.session.ApiKey)
 	if err != nil {
+		p.logger.Log("[INIT] ✗ External IP resolution failed: %v", err)
 		return fmt.Errorf("failed to get external IP: %w", err)
 	}
 	p.externalIP = ip
+	p.logger.Log("[INIT] ✓ External IP: %s", ip)
 
-	// Fetch base page to get dynamic values and potentially trigger challenges
+	p.logger.Log("[INIT] [2/5] Solving static Reese84 challenge...")
+	_, err = SolveStaticReese84(ctx, p.client, p.session, pkcBaseURL, p.proxy, pkcReese84ScriptPath, p.profile)
+	if err != nil {
+		p.logger.Log("[INIT] ✗ Static Reese84 failed: %v", err)
+		return fmt.Errorf("failed to solve static Reese84: %w", err)
+	}
+	p.logger.Log("[INIT] ✓ Static Reese84 solved")
+
+	p.logger.Log("[INIT] [3/5] Fetching homepage...")
 	body, statusCode, err := p.makeNavigationRequest(pkcHomeURL)
 	if err != nil {
+		p.logger.Log("[INIT] ✗ Homepage fetch failed: %v", err)
 		return fmt.Errorf("failed to fetch base page: %w", err)
 	}
+	p.logger.Log("[INIT] ✓ Homepage received: status=%d size=%dB", statusCode, len(body))
 
-	// Check if we got a Reese84 challenge and solve it proactively
 	if IsReese84Challenge(body) {
-		p.logger.Log("Solving Reese84 challenge...")
-		_, err := SolveReese84(ctx, p.client, p.session, pkcHomeURL, stringReader(body))
+		p.reese84Challenges++
+		p.logger.Log("[INIT] ⚠ Reese84 challenge detected on homepage (r84_count=%d)", p.reese84Challenges)
+		_, err := SolveReese84(ctx, p.client, p.session, pkcHomeURL, p.proxy, stringReader(body), p.profile)
 		if err != nil {
+			p.logger.Log("[INIT] ✗ Reese84 solve failed: %v", err)
 			return fmt.Errorf("failed to solve Reese84: %w", err)
 		}
+		p.logger.Log("[INIT] ✓ Reese84 solved")
 
-		// Refetch page after solving
+		p.logger.Log("[INIT] Refetching homepage...")
 		body, statusCode, err = p.makeNavigationRequest(pkcHomeURL)
 		if err != nil {
+			p.logger.Log("[INIT] ✗ Refetch failed: %v", err)
 			return fmt.Errorf("failed to refetch page: %w", err)
 		}
+		p.logger.Log("[INIT] ✓ Homepage refetched: status=%d size=%dB", statusCode, len(body))
+	} else {
+		p.logger.Log("[INIT] ✓ No Reese84 challenge")
 	}
 
-	// Assert session - check for additional challenges
+	p.logger.Log("[INIT] [4/5] Validating session state...")
 	if err := p.assertSession(ctx, body, statusCode); err != nil {
+		p.logger.Log("[INIT] ✗ Session validation failed: %v", err)
 		return fmt.Errorf("session assertion failed: %w", err)
 	}
+	p.logger.Log("[INIT] ✓ Session validated")
 
-	// Submit DataDome tags per Hyper documentation:
-	// "Posting tags should be done twice... First with type 'ch' and the second time with type 'le'"
-	// Only do this once per session to minimize API costs
 	if !p.tagsSent {
-		p.logger.Log("Submitting DataDome tags ('ch' + 'le')...")
-		// First 'ch' tag - updates datadome cookie
-		if err := p.SubmitDataDomeTag(ctx, pkcHomeURL, "ch"); err != nil {
-			p.logger.Log("DataDome 'ch' tag warning: %v", err)
+		p.logger.Log("[INIT] [5/5] Submitting DataDome tags...")
+		limiter := GetHyperLimiter(3)
+		limiter.Acquire()
+
+		if err := p.submitDataDomeTagNoLock(ctx, pkcHomeURL, "ch"); err != nil {
+			p.logger.Log("[INIT] ⚠ DataDome 'ch' tag failed (non-fatal): %v", err)
+		} else {
+			p.logger.Log("[INIT] ✓ DataDome 'ch' tag sent")
 		}
-		// Second 'le' tag - using the cookie from 'ch' response
-		if err := p.SubmitDataDomeTag(ctx, pkcHomeURL, "le"); err != nil {
-			p.logger.Log("DataDome 'le' tag warning: %v", err)
+		if err := p.submitDataDomeTagNoLock(ctx, pkcHomeURL, "le"); err != nil {
+			p.logger.Log("[INIT] ⚠ DataDome 'le' tag failed (non-fatal): %v", err)
+		} else {
+			p.logger.Log("[INIT] ✓ DataDome 'le' tag sent")
 		}
+
+		limiter.Release()
 		p.tagsSent = true
+	} else {
+		p.logger.Log("[INIT] [5/5] DataDome tags already sent")
 	}
 
+	p.logger.Log("[INIT] ✓ Initialization complete | stats=[r84=%d dd_int=%d dd_json=%d dd_fp=%d]",
+		p.reese84Challenges, p.ddInterstitials, p.ddJSONChallenges, p.ddFingerprintBlocks)
 	return nil
 }
 
@@ -200,29 +239,29 @@ func (p *PKCClient) InitializeSession(ctx context.Context) error {
 func (p *PKCClient) assertSession(ctx context.Context, body string, statusCode int) error {
 	// Check for DataDome interstitial (403 with captcha-delivery script)
 	if statusCode == 403 && IsDataDomeInterstitial(statusCode, body) {
-		p.logger.Log("DataDome interstitial detected, solving...")
-		headers, err := SolveDataDomeInterstitial(ctx, p.client, p.session, pkcHomeURL, body, p.logger)
+		p.ddInterstitials++
+		p.logger.Log("[CHALLENGE] DataDome interstitial on init (total: %d)", p.ddInterstitials)
+		headers, err := SolveDataDomeInterstitial(ctx, p.client, p.session, pkcHomeURL, p.proxy, body, p.logger, p.profile)
 		if err != nil {
+			p.logger.Log("[CHALLENGE] DataDome interstitial FAILED: %v", err)
 			return fmt.Errorf("failed to solve DataDome interstitial: %w", err)
 		}
 		if headers != nil {
 			p.headers = headers
-			p.logger.Log("Got headers from Hyper API (FullVersionList: %s)", headers.FullVersionList)
 		}
+		p.logger.Log("[CHALLENGE] DataDome interstitial solved")
 		return nil
 	}
 
 	// Check for DataDome slider challenge
 	if statusCode == 403 && strings.Contains(body, "ct.captcha-delivery.com/c.js") {
-		p.logger.Log("DataDome slider challenge detected")
-		// For now, return error - slider handling can be added later
+		p.logger.Log("[CHALLENGE] DataDome slider detected (not implemented)")
 		return fmt.Errorf("DataDome slider challenge not yet implemented")
 	}
 
 	// Check for Incapsula queue
 	if strings.Contains(body, "Incapsula_Resource") {
-		p.logger.Log("Incapsula queue detected")
-		// Queue handling would go here
+		p.logger.Log("[CHALLENGE] Incapsula queue detected (not implemented)")
 		return fmt.Errorf("Incapsula queue handling not yet implemented")
 	}
 
@@ -247,16 +286,48 @@ func (p *PKCClient) SubmitDataDomeTag(ctx context.Context, referer, tagType stri
 		datadomeCookie = "null"
 	}
 
-	// Get IP if not cached
 	if p.externalIP == "" {
-		ip, err := getExternalIP(p.client, p.session.ApiKey)
+		ip, err := getExternalIP(p.proxy, p.session.ApiKey)
 		if err != nil {
 			return fmt.Errorf("failed to get external IP: %w", err)
 		}
 		p.externalIP = ip
 	}
 
-	newCookie, err := submitDataDomeTags(ctx, p.client, p.session, referer, datadomeCookie, p.externalIP, tagType)
+	newCookie, err := submitDataDomeTags(ctx, p.client, p.session, referer, datadomeCookie, p.externalIP, tagType, p.profile)
+	if err != nil {
+		return err
+	}
+
+	if newCookie != "" {
+		setDatadomeCookie(p.client, parsedURL, newCookie)
+	}
+
+	return nil
+}
+
+// submitDataDomeTagNoLock submits a DataDome tag without acquiring the Hyper rate limiter.
+// Caller must acquire and release the limiter externally.
+func (p *PKCClient) submitDataDomeTagNoLock(ctx context.Context, referer, tagType string) error {
+	parsedURL, err := url.Parse(referer)
+	if err != nil {
+		return err
+	}
+
+	datadomeCookie := getDatadomeCookie(p.client, parsedURL)
+	if datadomeCookie == "" {
+		datadomeCookie = "null"
+	}
+
+	if p.externalIP == "" {
+		ip, err := getExternalIP(p.proxy, p.session.ApiKey)
+		if err != nil {
+			return fmt.Errorf("failed to get external IP: %w", err)
+		}
+		p.externalIP = ip
+	}
+
+	newCookie, err := submitDataDomeTagsNoLock(ctx, p.client, p.session, referer, datadomeCookie, p.externalIP, tagType, p.profile)
 	if err != nil {
 		return err
 	}
@@ -298,6 +369,15 @@ type EmailSignupSource struct {
 	UTMTerm          string `json:"utm_term"`
 	UTMContent       string `json:"utm_content"`
 }
+
+// Pre-allocated source to avoid repeated allocations
+var defaultEmailSource = EmailSignupSource{
+	BaseURL:          "/",
+	EngagementSource: "pcenter",
+}
+
+// Pre-allocated email lists slice
+var defaultEmailLists = []string{"pcenter"}
 
 // GetHomepage fetches the Pokemon Center homepage, handling Reese84 and DataDome challenges.
 func (p *PKCClient) GetHomepage(ctx context.Context) (string, error) {
@@ -535,141 +615,152 @@ func setEmailSignupCookies(client tls_client.HttpClient) string {
 }
 
 // EmailSignup signs up an email to the Pokemon Center newsletter.
-// Returns the email address that was signed up.
-func (p *PKCClient) EmailSignup(ctx context.Context, captchaAPIKey, email string) (string, error) {
-	// Generate and set correlation and Amplitude cookies
+func (p *PKCClient) EmailSignup(ctx context.Context, captchaProvider *CaptchaProvider, email string) (string, error) {
+	p.logger.Log("[SIGNUP] === Starting Email Signup ===")
+	p.logger.Log("[SIGNUP] email=%s provider=%s", email, captchaProvider.Name)
+
 	setEmailSignupCookies(p.client)
 
-	// Generate random DOB
-	dob := GenerateRandomDOOB()
-
-	p.logger.Log("Signing up: %s", email)
-
-	// Send tracking event (this sets SSRT and SSOD cookies required for signup)
-	p.sendEmailSignupTrackingEvent()
-
-	// Build request body
-	payload := map[string]any{
-		"email":  email,
-		"dob":    dob,
-		"region": "US",
-		"source": map[string]string{
-			"base_url":          "/",
-			"engagement_source": "pcenter",
-			"utm_source":        "",
-			"utm_medium":        "",
-			"utm_campaign":      "",
-			"utm_term":          "",
-			"utm_content":       "",
-		},
-		"email_lists": []string{"pcenter"},
-	}
-	bodyBytes, err := json.Marshal(payload)
+	body, err := json.Marshal(EmailSignupRequest{
+		Email:      email,
+		DOB:        GenerateRandomDOOB(),
+		Region:     "US",
+		Source:     defaultEmailSource,
+		EmailLists: defaultEmailLists,
+	})
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal signup payload: %w", err)
 	}
-	bodyStr := string(bodyBytes)
 
-	// Solve reCAPTCHA v3 (proxyless)
-	p.logger.Log("Solving reCAPTCHA...")
-	captchaToken, captchaErr := Get2CaptchaRecapV3Solution(captchaAPIKey, pkcHomeURL, pkcRecaptchaSiteKey, "submit", 0.3)
-	if captchaErr != nil {
-		return "", fmt.Errorf("failed to solve recaptcha: %w", captchaErr)
+	p.logger.Log("[SIGNUP] [PRE-FLIGHT] Solving initial reCAPTCHA (provider=%s, min_score=%.1f)...", captchaProvider.Name, pkcRecaptchaMinScore)
+	captchaToken, err := captchaProvider.Solve(captchaProvider.APIKey, pkcHomeURL, pkcRecaptchaSiteKey, "submit", p.proxy, p.profile.UserAgent, pkcRecaptchaMinScore)
+	if err != nil {
+		p.logger.Log("[SIGNUP] ✗ Captcha solve failed: %v", err)
+		return "", fmt.Errorf("failed to solve recaptcha: %w", err)
 	}
+	p.logger.Log("[SIGNUP] ✓ Captcha token obtained")
 
-	// Refresh cart auth and profile data
+	p.logger.Log("[SIGNUP] [PRE-FLIGHT] Refreshing cart auth...")
 	if _, err := p.GetCartAuth(ctx); err != nil {
+		p.logger.Log("[SIGNUP] ✗ Cart auth failed: %v", err)
 		return "", fmt.Errorf("failed to refresh cart auth: %w", err)
 	}
+	p.logger.Log("[SIGNUP] ✓ Cart auth refreshed")
+
+	p.sendAsmtUpdate()
+
+	p.logger.Log("[SIGNUP] [PRE-FLIGHT] Refreshing profile data...")
 	if _, err := p.GetProfileData(ctx); err != nil {
+		p.logger.Log("[SIGNUP] ✗ Profile data failed: %v", err)
 		return "", fmt.Errorf("failed to refresh profile data: %w", err)
 	}
+	p.logger.Log("[SIGNUP] ✓ Profile data refreshed")
 
-	p.sendEmailSignupTrackingEvent()
+	p.sendGAFunctionCalledEvent()
+	p.logger.Log("[SIGNUP] Pre-flight checks complete, entering submission loop")
 
-	// Submit signup request with retry handling for connection errors and captcha score failures
-	success, err := p.submitEmailSignup(ctx, captchaAPIKey, bodyStr, captchaToken)
-	if err != nil {
-		return "", err
-	}
-	if success {
-		return email, nil
-	}
-
-	return "", fmt.Errorf("signup failed")
-}
-
-// submitEmailSignup sends the actual signup request. Returns (success, error).
-// Handles connection errors with proxy-only rotation (up to maxSignupProxyRetries times)
-// and captcha score errors with new token fetches (up to maxCaptchaRetries times).
-func (p *PKCClient) submitEmailSignup(ctx context.Context, captchaAPIKey, bodyStr, captchaToken string) (bool, error) {
-	currentToken := captchaToken
-	captchaRetries := 0
+	sessionCaptchaFailures := 0
+	totalCaptchaRetries := 0
 	proxyRetries := 0
+	attemptNum := 0
 
-	for range maxChallengeRetries {
-		success, needsRetry, err := p.doSubmitEmailSignup(ctx, bodyStr, currentToken)
+	for {
+		attemptNum++
+		p.sendEmailSignupTrackingEvent()
 
-		// Keep handling recoverable errors until we succeed or exhaust retries
-		for err != nil {
-			// Handle captcha score too low - fetch new token and retry
-			if errors.Is(err, ErrCaptchaScoreTooLow) {
-				if captchaRetries >= maxCaptchaRetries {
-					return false, err // Exhausted captcha retries
-				}
-				captchaRetries++
-				p.logger.Log("Captcha score too low, fetching new token (attempt %d/%d)",
-					captchaRetries, maxCaptchaRetries)
-
-				newToken, captchaErr := Get2CaptchaRecapV3Solution(captchaAPIKey, pkcHomeURL, pkcRecaptchaSiteKey, "submit", 0.3)
-				if captchaErr != nil {
-					p.logger.Log("Failed to get new captcha token: %v", captchaErr)
-					continue // Try fetching token again
-				}
-
-				currentToken = newToken
-				success, needsRetry, err = p.doSubmitEmailSignup(ctx, bodyStr, currentToken)
-				continue // Check the new error
-			}
-
-			// Handle connection errors with proxy-only rotation
-			if IsRetryableError(err) {
-				if proxyRetries >= maxSignupProxyRetries {
-					return false, err // Exhausted proxy retries
-				}
-				proxyRetries++
-				p.logger.Log("Connection error on signup, rotating proxy (attempt %d/%d): %v",
-					proxyRetries, maxSignupProxyRetries, err)
-
-				if !p.RotateProxy() {
-					return false, fmt.Errorf("failed to rotate proxy: %w", err)
-				}
-
-				success, needsRetry, err = p.doSubmitEmailSignup(ctx, bodyStr, currentToken)
-				continue // Check the new error
-			}
-
-			// Non-recoverable error
-			return false, err
+		p.logger.Log("[SIGNUP] [ATTEMPT #%d] Submitting signup request...", attemptNum)
+		err := p.doSubmitEmailSignup(ctx, body, captchaToken)
+		if err == nil {
+			p.logger.Log("[SIGNUP] ✓ SUCCESS after %d attempts | stats=[cap_retries=%d session_rotations=%d proxy_rotations=%d challenges=[r84=%d dd_int=%d dd_json=%d dd_fp=%d]]",
+				attemptNum, totalCaptchaRetries, p.sessionRotations, p.proxyRotations, p.reese84Challenges, p.ddInterstitials, p.ddJSONChallenges, p.ddFingerprintBlocks)
+			return email, nil
 		}
 
-		if !needsRetry {
-			return success, nil
+		switch {
+		case errors.Is(err, ErrRetryNeeded):
+			p.logger.Log("[SIGNUP] [RETRY] Challenge solved, retrying immediately...")
+			continue
+
+		case errors.Is(err, ErrCaptchaScoreTooLow):
+			sessionCaptchaFailures++
+			totalCaptchaRetries++
+			p.logger.Log("[SIGNUP] ⚠ Captcha score too low | session_fails=%d/%d total_fails=%d",
+				sessionCaptchaFailures, captchaRotateThreshold, totalCaptchaRetries)
+
+			if sessionCaptchaFailures >= captchaRotateThreshold {
+				if p.sessionRotations >= maxSessionRotations {
+					p.logSignupFailure(email, totalCaptchaRetries, fmt.Errorf("max session rotations (%d) exceeded", maxSessionRotations))
+					return "", fmt.Errorf("captcha failures persisted across %d sessions", maxSessionRotations)
+				}
+
+				p.logger.Log("[SIGNUP] [SESSION-ROTATE] Poor session quality detected, rotating full session (%d/%d)...",
+					p.sessionRotations+1, maxSessionRotations)
+				if err := p.ReinitializeSession(ctx); err != nil {
+					p.logSignupFailure(email, totalCaptchaRetries, err)
+					return "", err
+				}
+				sessionCaptchaFailures = 0
+
+				p.logger.Log("[SIGNUP] [POST-ROTATE] Refreshing cart auth...")
+				if _, err := p.GetCartAuth(ctx); err != nil {
+					return "", fmt.Errorf("failed to refresh cart auth after rotation: %w", err)
+				}
+				p.sendAsmtUpdate()
+				p.logger.Log("[SIGNUP] [POST-ROTATE] Refreshing profile data...")
+				if _, err := p.GetProfileData(ctx); err != nil {
+					return "", fmt.Errorf("failed to refresh profile data after rotation: %w", err)
+				}
+				p.sendGAFunctionCalledEvent()
+				p.logger.Log("[SIGNUP] [POST-ROTATE] Session refresh complete")
+			}
+
+			p.logger.Log("[SIGNUP] [CAPTCHA-RETRY] Solving new captcha token (provider=%s, min_score=%.1f)...", captchaProvider.Name, pkcRecaptchaMinScore)
+			captchaToken, err = captchaProvider.Solve(captchaProvider.APIKey, pkcHomeURL, pkcRecaptchaSiteKey, "submit", p.proxy, p.profile.UserAgent, pkcRecaptchaMinScore)
+			if err != nil {
+				if IsFatalError(err) {
+					return "", err
+				}
+				return "", fmt.Errorf("failed to get new captcha: %w", err)
+			}
+			p.logger.Log("[SIGNUP] [CAPTCHA-RETRY] ✓ New token obtained")
+
+		case IsRetryableError(err):
+			if proxyRetries >= maxProxyRetries {
+				p.logSignupFailure(email, totalCaptchaRetries, fmt.Errorf("max proxy retries (%d) exceeded: %w", maxProxyRetries, err))
+				return "", err
+			}
+			proxyRetries++
+			p.logger.Log("[SIGNUP] [PROXY-ROTATE] Connection error, rotating proxy (%d/%d) | error=%v", proxyRetries, maxProxyRetries, err)
+			if !p.RotateProxy() {
+				return "", fmt.Errorf("failed to rotate proxy: %w", err)
+			}
+
+		case IsFatalError(err):
+			p.logger.Log("[SIGNUP] ✗ FATAL error encountered: %v", err)
+			p.logSignupFailure(email, totalCaptchaRetries, err)
+			return "", err
+
+		default:
+			p.logger.Log("[SIGNUP] ✗ Unknown error: %v", err)
+			p.logSignupFailure(email, totalCaptchaRetries, err)
+			return "", err
 		}
 	}
-	return false, fmt.Errorf("submitEmailSignup: max challenge retries (%d) exceeded", maxChallengeRetries)
 }
 
-func (p *PKCClient) doSubmitEmailSignup(ctx context.Context, bodyStr, captchaToken string) (bool, bool, error) {
-	bodyBytes := []byte(bodyStr)
+// logSignupFailure logs detailed session stats on signup failure for analysis.
+func (p *PKCClient) logSignupFailure(email string, captchaRetries int, err error) {
+	p.logger.Log("[SIGNUP] FAILED %s | captcha_retries=%d challenges=[r84=%d dd_int=%d dd_json=%d dd_block=%d] rotations=[proxy=%d session=%d] error=%v",
+		email, captchaRetries, p.reese84Challenges, p.ddInterstitials, p.ddJSONChallenges, p.ddFingerprintBlocks,
+		p.proxyRotations, p.sessionRotations, err)
+}
 
-	req, err := http.NewRequest(http.MethodPost, pkcEmailSignupURL, bytes.NewReader(bodyBytes))
+func (p *PKCClient) doSubmitEmailSignup(ctx context.Context, body []byte, captchaToken string) error {
+	req, err := http.NewRequest(http.MethodPost, pkcEmailSignupURL, bytes.NewReader(body))
 	if err != nil {
-		return false, false, err
+		return err
 	}
 
-	// Headers matching browser exactly - NO extra sec-ch-ua headers
-	// Browser only sends: sec-ch-ua-platform, sec-ch-ua, sec-ch-ua-mobile
 	req.Header = http.Header{
 		"Host":               {"www.pokemoncenter.com"},
 		"Connection":         {"keep-alive"},
@@ -712,96 +803,112 @@ func (p *PKCClient) doSubmitEmailSignup(ctx context.Context, bodyStr, captchaTok
 
 	resp, err := p.doRequest(req)
 	if err != nil {
-		return false, false, err
+		p.logger.Log("[SIGNUP] ✗ HTTP request failed: %v", err)
+		return err
 	}
 	defer resp.Body.Close()
 
-	respBodyBytes, err := readResponseBody(resp)
+	respBody, err := readResponseBody(resp)
 	if err != nil {
-		return false, false, err
+		p.logger.Log("[SIGNUP] ✗ Failed to read response: %v", err)
+		return err
 	}
 
-	// Check for protection challenges
-	if resp.StatusCode != 204 && resp.StatusCode != 200 {
-		// Check for captcha score failure (403 with specific message)
-		if resp.StatusCode == 403 && strings.Contains(string(respBodyBytes), "identity-based policy") {
-			return false, false, ErrCaptchaScoreTooLow
-		}
+	p.logger.Log("[SIGNUP] Response received: status=%d size=%dB", resp.StatusCode, len(respBody))
 
-		solved, err := p.handleBadResponse(ctx, resp.StatusCode, respBodyBytes, pkcEmailSignupURL)
-		if err != nil {
-			return false, false, err
-		}
-		if solved {
-			return false, true, nil // Signal retry needed
-		}
-		return false, false, fmt.Errorf("unhandled %d response: %s", resp.StatusCode, string(respBodyBytes))
-	}
-
-	// 204 No Content means success
 	if resp.StatusCode == 204 {
-		p.logger.Log("Email signup successful!")
-		return true, false, nil
+		p.logger.Log("[SIGNUP] ✓ Accepted (204 No Content)")
+		return nil
 	}
 
-	return false, false, fmt.Errorf("unexpected response status: %d", resp.StatusCode)
+	bodyStr := string(respBody)
+
+	if resp.StatusCode == 403 && strings.Contains(bodyStr, "identity-based policy") {
+		p.logger.Log("[SIGNUP] ✗ Rejected by identity-based policy (captcha score insufficient)")
+		return ErrCaptchaScoreTooLow
+	}
+
+	p.logger.Log("[SIGNUP] Non-200 response, analyzing for challenges...")
+	solved, err := p.handleBadResponseStr(ctx, resp.StatusCode, bodyStr, pkcEmailSignupURL)
+	if err != nil {
+		p.logger.Log("[SIGNUP] ✗ Challenge handling error: %v", err)
+		return err
+	}
+	if solved {
+		p.logger.Log("[SIGNUP] ✓ Challenge solved, retry needed")
+		return ErrRetryNeeded
+	}
+
+	p.logger.Log("[SIGNUP] ✗ Unhandled response | status=%d body=%s", resp.StatusCode, truncate(bodyStr, 200))
+	return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, bodyStr)
 }
 
 // handleBadResponse checks for and solves protection challenges in error responses.
 // Returns (solved, error) - if solved is true, the caller should retry the request.
 func (p *PKCClient) handleBadResponse(ctx context.Context, statusCode int, body []byte, referer string) (bool, error) {
-	bodyStr := string(body)
+	return p.handleBadResponseStr(ctx, statusCode, string(body), referer)
+}
 
-	// Check for Reese84 challenge first (can appear on any status code including 400)
+// handleBadResponseStr is the string variant to avoid redundant conversions when caller already has a string.
+func (p *PKCClient) handleBadResponseStr(ctx context.Context, statusCode int, bodyStr, referer string) (bool, error) {
+	p.logger.Log("[CHALLENGE] Analyzing response: status=%d size=%dB", statusCode, len(bodyStr))
+
 	if IsReese84Challenge(bodyStr) {
-		p.logger.Log("Reese84 challenge detected, solving...")
-		_, err := SolveReese84(ctx, p.client, p.session, referer, stringReader(bodyStr))
+		p.reese84Challenges++
+		p.logger.Log("[CHALLENGE] ⚠ Reese84 detected | session_total=%d", p.reese84Challenges)
+		_, err := SolveReese84(ctx, p.client, p.session, referer, p.proxy, stringReader(bodyStr), p.profile)
 		if err != nil {
+			p.logger.Log("[CHALLENGE] ✗ Reese84 solve failed: %v", err)
 			return false, fmt.Errorf("failed to solve Reese84: %w", err)
 		}
+		p.logger.Log("[CHALLENGE] ✓ Reese84 solved successfully")
 		return true, nil
 	}
 
-	// Handle 403 responses
 	if statusCode == 403 {
-		// Check for JSON-based DataDome challenge (API responses return JSON with URL)
 		var ddResp struct {
 			URL string `json:"url"`
 		}
-		if json.Unmarshal(body, &ddResp) == nil && ddResp.URL != "" {
-			p.logger.Log("DataDome JSON challenge detected, solving...")
+		if json.Unmarshal([]byte(bodyStr), &ddResp) == nil && ddResp.URL != "" {
+			p.ddJSONChallenges++
+			p.logger.Log("[CHALLENGE] ⚠ DataDome JSON challenge detected | url=%s | session_total=%d", ddResp.URL, p.ddJSONChallenges)
 			if err := p.solveDataDomeJSONChallenge(ctx, ddResp.URL, referer); err != nil {
+				p.logger.Log("[CHALLENGE] ✗ DataDome JSON solve failed: %v", err)
 				return false, fmt.Errorf("failed to solve DataDome JSON challenge: %w", err)
 			}
+			p.logger.Log("[CHALLENGE] ✓ DataDome JSON solved successfully")
 			return true, nil
 		}
 
-		// Check for HTML-based DataDome interstitial
 		if IsDataDomeInterstitial(statusCode, bodyStr) {
-			p.logger.Log("DataDome HTML interstitial detected, solving...")
-			headers, err := SolveDataDomeInterstitial(ctx, p.client, p.session, referer, bodyStr, p.logger)
+			p.ddInterstitials++
+			p.logger.Log("[CHALLENGE] ⚠ DataDome interstitial detected | session_total=%d", p.ddInterstitials)
+			headers, err := SolveDataDomeInterstitial(ctx, p.client, p.session, referer, p.proxy, bodyStr, p.logger, p.profile)
 			if err != nil {
+				p.logger.Log("[CHALLENGE] ✗ DataDome interstitial solve failed: %v", err)
 				return false, fmt.Errorf("failed to solve DataDome interstitial: %w", err)
 			}
 			if headers != nil {
 				p.headers = headers
 			}
+			p.logger.Log("[CHALLENGE] ✓ DataDome interstitial solved successfully")
 			return true, nil
 		}
 
-		// Check for DataDome fingerprint enforcement block
-		// This indicates a fundamental fingerprint mismatch - retrying won't help
 		if IsDataDomeFingerprintBlock(statusCode, bodyStr) {
-			p.logger.Log("DataDome fingerprint block detected - session fingerprint rejected")
-			return false, fmt.Errorf("DataDome fingerprint block: session fingerprint rejected (possible Chrome version mismatch between captcha solver and request)")
+			p.ddFingerprintBlocks++
+			p.logger.Log("[CHALLENGE] ✗ DataDome fingerprint BLOCKED | session_total=%d | fingerprint_rejected", p.ddFingerprintBlocks)
+			return false, fmt.Errorf("DataDome fingerprint block: session fingerprint rejected")
 		}
 
-		// Unknown 403
-		preview := bodyStr
-		if len(preview) > 500 {
-			preview = preview[:500]
-		}
-		return false, fmt.Errorf("unhandled 403 response: %s", preview)
+		p.logger.Log("[CHALLENGE] ✗ Unhandled 403 response | preview=%s", truncate(bodyStr, 150))
+		return false, fmt.Errorf("unhandled 403 response: %s", truncate(bodyStr, 500))
+	}
+
+	// HTTP 400 with HTML content indicates proxy/CDN issues (retryable)
+	if statusCode == 400 && strings.HasPrefix(strings.TrimSpace(bodyStr), "<!DOCTYPE") {
+		p.logger.Log("[CHALLENGE] HTTP 400 with HTML detected (proxy/CDN issue)")
+		return false, fmt.Errorf("%w: HTTP 400 with HTML response", ErrProxyBadRequest)
 	}
 
 	// Unhandled status code
@@ -824,12 +931,12 @@ func (p *PKCClient) solveDataDomeJSONChallenge(ctx context.Context, deviceLink, 
 
 		// Check if it's a session corruption error
 		if strings.Contains(err.Error(), "malformed device link") || strings.Contains(err.Error(), "missing html") {
-			p.logger.Log("Session corrupted, rotating session...")
+			p.logger.Log("[SESSION] Corruption detected, rotating...")
 			// Rotate session to get fresh HTTP client + session (not just proxy)
 			if p.RotateSession() {
 				// Re-initialize session with new proxy
 				if initErr := p.InitializeSession(ctx); initErr != nil {
-					p.logger.Log("WARNING: Session re-init failed: %v", initErr)
+					p.logger.Log("[SESSION] Re-init after corruption FAILED: %v", initErr)
 				}
 			} else {
 				// No proxy manager, just reset session
@@ -846,13 +953,13 @@ func (p *PKCClient) solveDataDomeJSONChallenge(ctx context.Context, deviceLink, 
 // doSolveDataDomeJSONChallenge performs the actual DataDome challenge solving.
 func (p *PKCClient) doSolveDataDomeJSONChallenge(ctx context.Context, deviceLink, referer string) error {
 	// Fetch the device check page
-	deviceHTML, err := fetchDeviceCheckPage(p.client, deviceLink, referer)
+	deviceHTML, err := fetchDeviceCheckPage(p.client, deviceLink, referer, p.profile)
 	if err != nil {
 		return fmt.Errorf("failed to fetch device check page: %w", err)
 	}
 
 	// Get external IP
-	externalIP, err := getExternalIP(p.client, p.session.ApiKey)
+	externalIP, err := getExternalIP(p.proxy, p.session.ApiKey)
 	if err != nil {
 		return fmt.Errorf("failed to get external IP: %w", err)
 	}
@@ -875,7 +982,7 @@ func (p *PKCClient) doSolveDataDomeJSONChallenge(ctx context.Context, deviceLink
 	}
 
 	// POST the payload to solve the challenge
-	resp, err := submitInterstitialPayload(p.client, deviceLink, payload)
+	resp, err := submitInterstitialPayload(p.client, deviceLink, payload, p.profile)
 	if err != nil {
 		return fmt.Errorf("failed to submit interstitial payload: %w", err)
 	}
@@ -889,9 +996,152 @@ func (p *PKCClient) doSolveDataDomeJSONChallenge(ctx context.Context, deviceLink
 	return nil
 }
 
+// sendAsmtUpdate sends the assessment update request that must occur before GetProfileData.
+// This request sets the SSID cookie that is required for profile requests.
+func (p *PKCClient) sendAsmtUpdate() error {
+	if !pkcEnableTracking {
+		return nil
+	}
+
+	asmtURL := pkcBaseURL + "/__ssobj/asmt_update"
+
+	// Generate random assessment IDs (5-digit numbers)
+	id1 := 10000 + rand.Intn(90000)
+	id2 := 10000 + rand.Intn(90000)
+	bodyJSON := []byte(fmt.Sprintf(`{"%d":true,"%d":true}`, id1, id2))
+
+	req, err := http.NewRequest(http.MethodPost, asmtURL, bytes.NewReader(bodyJSON))
+	if err != nil {
+		return err
+	}
+
+	req.Header = http.Header{
+		"Host":               {"www.pokemoncenter.com"},
+		"Connection":         {"keep-alive"},
+		"sec-ch-ua-platform": {`"Windows"`},
+		"sec-ch-ua":          {p.profile.SecChUa},
+		"sec-ch-ua-mobile":   {"?0"},
+		"User-Agent":         {p.profile.UserAgent},
+		"Content-Type":       {"application/json;charset=UTF-8"},
+		"Accept":             {"*/*"},
+		"Origin":             {pkcBaseURL},
+		"Sec-Fetch-Site":     {"same-origin"},
+		"Sec-Fetch-Mode":     {"cors"},
+		"Sec-Fetch-Dest":     {"empty"},
+		"Referer":            {pkcHomeURL},
+		"Accept-Encoding":    {"gzip, deflate, br, zstd"},
+		"Accept-Language":    {"en-US,en;q=0.9"},
+		http.HeaderOrderKey: {
+			"Host",
+			"Connection",
+			"Content-Length",
+			"sec-ch-ua-platform",
+			"sec-ch-ua",
+			"sec-ch-ua-mobile",
+			"User-Agent",
+			"Content-Type",
+			"Accept",
+			"Origin",
+			"Sec-Fetch-Site",
+			"Sec-Fetch-Mode",
+			"Sec-Fetch-Dest",
+			"Referer",
+			"Accept-Encoding",
+			"Accept-Language",
+		},
+		http.PHeaderOrderKey: PseudoHeaderOrder,
+	}
+
+	resp, err := p.doRequest(req)
+	if err != nil {
+		p.logger.Log("[TRACKING] asmt_update request error (non-fatal): %v", err)
+		return nil // Don't fail on tracking errors
+	}
+	defer resp.Body.Close()
+
+	// Read and discard body - these tracking endpoints shouldn't return challenges
+	io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode != 200 {
+		p.logger.Log("[TRACKING] asmt_update returned status %d (non-fatal)", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// sendGAFunctionCalledEvent sends the tracking event after GetProfileData.
+// This request sets additional session tracking cookies.
+func (p *PKCClient) sendGAFunctionCalledEvent() error {
+	if !pkcEnableTracking {
+		return nil
+	}
+
+	// Build tracking URL with timestamp
+	timestamp := time.Now().UnixMilli()
+	trackingURL := fmt.Sprintf("%s/__ssobj/track?event=ss-GA-Function-Called&value=undefined&x=%d-1", pkcBaseURL, timestamp)
+
+	req, err := http.NewRequest(http.MethodGet, trackingURL, nil)
+	if err != nil {
+		return err
+	}
+
+	req.Header = http.Header{
+		"Host":               {"www.pokemoncenter.com"},
+		"Connection":         {"keep-alive"},
+		"sec-ch-ua-platform": {`"Windows"`},
+		"X-Requested-With":   {"XMLHttpRequest"},
+		"User-Agent":         {p.profile.UserAgent},
+		"Accept":             {"*/*"},
+		"sec-ch-ua":          {p.profile.SecChUa},
+		"sec-ch-ua-mobile":   {"?0"},
+		"Sec-Fetch-Site":     {"same-origin"},
+		"Sec-Fetch-Mode":     {"cors"},
+		"Sec-Fetch-Dest":     {"empty"},
+		"Referer":            {pkcHomeURL},
+		"Accept-Encoding":    {"gzip, deflate, br, zstd"},
+		"Accept-Language":    {"en-US,en;q=0.9"},
+		http.HeaderOrderKey: {
+			"Host",
+			"Connection",
+			"sec-ch-ua-platform",
+			"X-Requested-With",
+			"User-Agent",
+			"Accept",
+			"sec-ch-ua",
+			"sec-ch-ua-mobile",
+			"Sec-Fetch-Site",
+			"Sec-Fetch-Mode",
+			"Sec-Fetch-Dest",
+			"Referer",
+			"Accept-Encoding",
+			"Accept-Language",
+		},
+		http.PHeaderOrderKey: PseudoHeaderOrder,
+	}
+
+	resp, err := p.doRequest(req)
+	if err != nil {
+		p.logger.Log("[TRACKING] GA event request error (non-fatal): %v", err)
+		return nil // Don't fail on tracking errors
+	}
+	defer resp.Body.Close()
+
+	// Read and discard body
+	io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode != 200 && resp.StatusCode != 204 {
+		p.logger.Log("[TRACKING] GA event returned unexpected status %d (non-fatal)", resp.StatusCode)
+	}
+
+	return nil
+}
+
 // sendEmailSignupTrackingEvent sends the tracking event that must occur before email signup.
 // This request sets SSRT and SSOD cookies that are required for the signup to succeed.
 func (p *PKCClient) sendEmailSignupTrackingEvent() error {
+	if !pkcEnableTracking {
+		return nil
+	}
 
 	// Build tracking URL with timestamp
 	timestamp := time.Now().UnixMilli()
@@ -1062,6 +1312,14 @@ func (p *PKCClient) makeNavigationRequest(targetURL string) (string, int, error)
 	}
 
 	return string(bodyBytes), resp.StatusCode, nil
+}
+
+// truncate returns s truncated to maxLen characters with "..." suffix if truncated.
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }
 
 // stringReader creates an io.Reader from a string.

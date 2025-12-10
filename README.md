@@ -6,14 +6,15 @@ A high-performance concurrent email registration tool with proxy rotation and bo
 
 - Concurrent worker pool with configurable parallelism
 - Automatic proxy rotation
-- Bot protection bypass
-- CAPTCHA solving integration
+- Bot protection bypass (Reese84, DataDome)
+- Multi-provider CAPTCHA solving with round-robin load balancing
+- Supports CapMonster, 2Captcha, and CapSolver simultaneously
 - Graceful error handling and shutdown
 
 ## Requirements
 
 - Go 1.21+
-- Valid CAPTCHA solver API key (2Captcha or CapSolver)
+- At least one CAPTCHA solver API key (2Captcha, CapSolver, or CapMonster)
 - HTTP proxies
 
 ## Setup
@@ -28,8 +29,17 @@ A high-performance concurrent email registration tool with proxy rotation and bo
 3. Create a `.env` file with your API keys:
    ```
    HYPER_API_KEY=your_hyper_api_key
+
+   # CAPTCHA Providers (at least one required, all three can be used simultaneously)
+   CAPMONSTER_KEY=your_capmonster_api_key
    2CAP_KEY=your_2captcha_api_key
+   CAPSOLVER_KEY=your_capsolver_api_key
    ```
+
+   **Note:** The tool will automatically distribute CAPTCHA solving tasks evenly across all configured providers using round-robin distribution. This helps with:
+   - Load balancing across multiple accounts
+   - Cost optimization
+   - Failover redundancy
 
 4. Create a `proxies.txt` file with one proxy per line:
    ```

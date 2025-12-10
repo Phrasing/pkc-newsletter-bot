@@ -2,25 +2,21 @@ package main
 
 import "os"
 
-// Build-time variables - inject via ldflags
-// Example: go build -ldflags "-X main.hyperAPIKey=YOUR_KEY -X main.captchaAPIKey=YOUR_KEY"
 var (
-	hyperAPIKey   string // -X main.hyperAPIKey=...
-	captchaAPIKey string // -X main.captchaAPIKey=...
+	hyperAPIKey   string
+	captchaAPIKey string
+	capmonsterKey string
+	capsolverKey  string
 )
 
-// GetHyperAPIKey returns the Hyper API key (build-time or env fallback)
-func GetHyperAPIKey() string {
-	if hyperAPIKey != "" {
-		return hyperAPIKey
+func getAPIKey(buildKey, envKey string) string {
+	if buildKey != "" {
+		return buildKey
 	}
-	return os.Getenv("HYPER_API_KEY")
+	return os.Getenv(envKey)
 }
 
-// GetCaptchaAPIKey returns the 2Captcha API key (build-time or env fallback)
-func GetCaptchaAPIKey() string {
-	if captchaAPIKey != "" {
-		return captchaAPIKey
-	}
-	return os.Getenv("2CAP_KEY")
-}
+func GetHyperAPIKey() string      { return getAPIKey(hyperAPIKey, "HYPER_API_KEY") }
+func GetCaptchaAPIKey() string    { return getAPIKey(captchaAPIKey, "2CAP_KEY") }
+func GetCapMonsterAPIKey() string { return getAPIKey(capmonsterKey, "CAPMONSTER_KEY") }
+func GetCapSolverAPIKey() string  { return getAPIKey(capsolverKey, "CAPSOLVER_KEY") }

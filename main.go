@@ -12,16 +12,14 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// Command line arguments
 var (
 	targetSignups int
 	workerCount   int
+	engineLog     *log.Logger
 )
 
-// workerStaggerDelay is the delay between starting each worker to avoid overwhelming APIs.
 const workerStaggerDelay = 50 * time.Millisecond
 
-// moduleLogger implements Logger and writes to the module-specific log file.
 type moduleLogger struct {
 	logger *log.Logger
 }
@@ -29,9 +27,6 @@ type moduleLogger struct {
 func (m *moduleLogger) Log(format string, args ...any) {
 	m.logger.Printf("      "+format, args...)
 }
-
-// engineLog is used for scheduler/runtime logs.
-var engineLog *log.Logger
 
 func main() {
 	parseArgs()
@@ -49,10 +44,6 @@ func main() {
 	os.Exit(exitCode)
 }
 
-// parseArgs parses and validates command line arguments.
-// Supports two modes:
-//   - pkc <catchall-domain> <target-signups> <worker-count> - generates emails
-//   - pkc <target-signups> <worker-count> - reads from emails.txt
 func parseArgs() {
 	if len(os.Args) < 3 {
 		log.Fatal("Usage: pkc [catchall-domain] <target-signups> <worker-count>\nExamples:\n  pkc fiercloud.com 500 100  (generate emails)\n  pkc 500 100                 (use emails.txt)")
@@ -60,9 +51,7 @@ func parseArgs() {
 
 	var err error
 
-	// Check if first arg is a number (no catchall) or domain (with catchall)
 	if _, err = strconv.Atoi(os.Args[1]); err == nil {
-		// First arg is a number - no catchall, use emails.txt
 		if len(os.Args) < 3 {
 			log.Fatal("Usage: pkc <target-signups> <worker-count>")
 		}
@@ -72,7 +61,6 @@ func parseArgs() {
 			log.Fatal("worker-count must be a positive integer")
 		}
 	} else {
-		// First arg is domain - catchall mode
 		if len(os.Args) < 4 {
 			log.Fatal("Usage: pkc <catchall-domain> <target-signups> <worker-count>")
 		}
@@ -92,8 +80,6 @@ func parseArgs() {
 	}
 }
 
-// setupLogging initializes engine and module loggers.
-// Returns file handles that should be deferred closed by caller.
 func setupLogging() (engineLogFile, moduleLogFile *os.File, modLog *log.Logger) {
 	var err error
 
@@ -112,7 +98,6 @@ func setupLogging() (engineLogFile, moduleLogFile *os.File, modLog *log.Logger) 
 	return engineLogFile, moduleLogFile, modLog
 }
 
-// loadResources loads proxies and validates the captcha API key.
 func loadResources() (*ProxyManager, string) {
 	proxyManager, err := NewProxyManager("proxies.txt")
 	if err != nil {
@@ -120,15 +105,17 @@ func loadResources() (*ProxyManager, string) {
 	}
 	engineLog.Printf("Loaded %d proxies", proxyManager.Count())
 
-	captchaKey := GetCaptchaAPIKey()
-	if captchaKey == "" {
-		engineLog.Fatal("2CAP_KEY not set (use -ldflags or .env)")
+	hasCapMonster := GetCapMonsterAPIKey() != ""
+	has2Captcha := GetCaptchaAPIKey() != ""
+	hasCapSolver := GetCapSolverAPIKey() != ""
+
+	if !hasCapMonster && !has2Captcha && !hasCapSolver {
+		engineLog.Fatal("No captcha providers configured. Set at least one: CAPMONSTER_KEY, 2CAP_KEY, or CAPSOLVER_KEY")
 	}
 
-	return proxyManager, captchaKey
+	return proxyManager, ""
 }
 
-// createScheduler initializes the worker scheduler.
 func createScheduler(proxyManager *ProxyManager, captchaKey string, modLog *log.Logger) *Scheduler {
 	scheduler, err := NewScheduler(workerCount, proxyManager, captchaKey, workerStaggerDelay, &moduleLogger{logger: modLog})
 	if err != nil {
@@ -137,7 +124,6 @@ func createScheduler(proxyManager *ProxyManager, captchaKey string, modLog *log.
 	return scheduler
 }
 
-// run executes the main signup loop. Returns exit code.
 func run(scheduler *Scheduler) int {
 	engineLog.Printf("Starting %d concurrent workers (target: %d signups, stagger: %v)...", workerCount, targetSignups, workerStaggerDelay)
 

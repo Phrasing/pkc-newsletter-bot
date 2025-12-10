@@ -39,12 +39,11 @@ func IsDataDomeInterstitial(statusCode int, body string) bool {
 	return statusCode == 403 && strings.Contains(body, "ct.captcha-delivery.com/i.js")
 }
 
-// IsDataDomeFingerprintBlock detects blocks with 't':'fe' (fingerprint enforcement).
 func IsDataDomeFingerprintBlock(statusCode int, body string) bool {
 	return statusCode == 403 && strings.Contains(body, "var dd=") && strings.Contains(body, "'t':'fe'")
 }
 
-func SolveDataDomeInterstitial(ctx context.Context, client tls_client.HttpClient, session *hyper.Session, pageURL string, challengeBody string, logger Logger) (*hyper.Headers, error) {
+func SolveDataDomeInterstitial(ctx context.Context, client tls_client.HttpClient, session *hyper.Session, pageURL, proxyURL, challengeBody string, logger Logger, profile *BrowserProfile) (*hyper.Headers, error) {
 	parsedURL, err := url.Parse(pageURL)
 	if err != nil {
 		return nil, err
@@ -66,12 +65,12 @@ func SolveDataDomeInterstitial(ctx context.Context, client tls_client.HttpClient
 	}
 
 	logger.Log("Fetching interstitial script...")
-	deviceHTML, err := fetchDeviceCheckPage(client, deviceLink, pageURL)
+	deviceHTML, err := fetchDeviceCheckPage(client, deviceLink, pageURL, profile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch device check page: %w", err)
 	}
 
-	externalIP, err := getExternalIP(client, session.ApiKey)
+	externalIP, err := getExternalIP(proxyURL, session.ApiKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get external IP: %w", err)
 	}
@@ -82,7 +81,7 @@ func SolveDataDomeInterstitial(ctx context.Context, client tls_client.HttpClient
 	defer limiter.Release()
 
 	payload, headers, err := session.GenerateDataDomeInterstitial(ctx, &hyper.DataDomeInterstitialInput{
-		UserAgent:      Chrome143UserAgent,
+		UserAgent:      profile.UserAgent,
 		DeviceLink:     deviceLink,
 		Html:           deviceHTML,
 		AcceptLanguage: "en-US",
@@ -96,7 +95,7 @@ func SolveDataDomeInterstitial(ctx context.Context, client tls_client.HttpClient
 	}
 
 	logger.Log("Submitting interstitial solution...")
-	resp, err := submitInterstitialPayload(client, deviceLink, payload)
+	resp, err := submitInterstitialPayload(client, deviceLink, payload, profile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to submit interstitial payload: %w", err)
 	}
@@ -110,7 +109,7 @@ func SolveDataDomeInterstitial(ctx context.Context, client tls_client.HttpClient
 	return headers, nil
 }
 
-func fetchDeviceCheckPage(client tls_client.HttpClient, deviceLink, referer string) (string, error) {
+func fetchDeviceCheckPage(client tls_client.HttpClient, deviceLink, referer string, profile *BrowserProfile) (string, error) {
 	req, err := http.NewRequest(http.MethodGet, deviceLink, nil)
 	if err != nil {
 		return "", err
@@ -118,8 +117,8 @@ func fetchDeviceCheckPage(client tls_client.HttpClient, deviceLink, referer stri
 
 	req.Header = http.Header{
 		"sec-ch-ua-platform": {`"Windows"`},
-		"user-agent":         {Chrome143UserAgent},
-		"sec-ch-ua":          {Chrome143SecChUa},
+		"user-agent":         {profile.UserAgent},
+		"sec-ch-ua":          {profile.SecChUa},
 		"sec-ch-ua-mobile":   {"?0"},
 		"accept":             {"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"},
 		"sec-fetch-site":     {"cross-site"},
@@ -158,7 +157,7 @@ func fetchDeviceCheckPage(client tls_client.HttpClient, deviceLink, referer stri
 	return string(bodyBytes), nil
 }
 
-func submitInterstitialPayload(client tls_client.HttpClient, deviceLink, payload string) (*DataDomeInterstitialResponse, error) {
+func submitInterstitialPayload(client tls_client.HttpClient, deviceLink, payload string, profile *BrowserProfile) (*DataDomeInterstitialResponse, error) {
 	req, err := http.NewRequest(http.MethodPost, "https://geo.captcha-delivery.com/interstitial/", strings.NewReader(payload))
 	if err != nil {
 		return nil, err
@@ -166,8 +165,8 @@ func submitInterstitialPayload(client tls_client.HttpClient, deviceLink, payload
 
 	req.Header = http.Header{
 		"sec-ch-ua-platform": {`"Windows"`},
-		"user-agent":         {Chrome143UserAgent},
-		"sec-ch-ua":          {Chrome143SecChUa},
+		"user-agent":         {profile.UserAgent},
+		"sec-ch-ua":          {profile.SecChUa},
 		"content-type":       {"application/x-www-form-urlencoded; charset=UTF-8"},
 		"sec-ch-ua-mobile":   {"?0"},
 		"accept":             {"*/*"},
@@ -216,13 +215,17 @@ func submitInterstitialPayload(client tls_client.HttpClient, deviceLink, payload
 	return &result, nil
 }
 
-func submitDataDomeTags(ctx context.Context, client tls_client.HttpClient, session *hyper.Session, pageURL, datadomeCookie, externalIP, tagsType string) (string, error) {
+func submitDataDomeTags(ctx context.Context, client tls_client.HttpClient, session *hyper.Session, pageURL, datadomeCookie, externalIP, tagsType string, profile *BrowserProfile) (string, error) {
 	limiter := GetHyperLimiter(3)
 	limiter.Acquire()
 	defer limiter.Release()
 
+	return submitDataDomeTagsNoLock(ctx, client, session, pageURL, datadomeCookie, externalIP, tagsType, profile)
+}
+
+func submitDataDomeTagsNoLock(ctx context.Context, client tls_client.HttpClient, session *hyper.Session, pageURL, datadomeCookie, externalIP, tagsType string, profile *BrowserProfile) (string, error) {
 	payload, err := session.GenerateDataDomeTags(ctx, &hyper.DataDomeTagsInput{
-		UserAgent:      Chrome143UserAgent,
+		UserAgent:      profile.UserAgent,
 		Cid:            datadomeCookie,
 		Ddk:            datadomeDDK,
 		Referer:        pageURL,
@@ -246,8 +249,8 @@ func submitDataDomeTags(ctx context.Context, client tls_client.HttpClient, sessi
 	req.Header = http.Header{
 		"content-type":       {"application/x-www-form-urlencoded"},
 		"sec-ch-ua-platform": {`"Windows"`},
-		"user-agent":         {Chrome143UserAgent},
-		"sec-ch-ua":          {Chrome143SecChUa},
+		"user-agent":         {profile.UserAgent},
+		"sec-ch-ua":          {profile.SecChUa},
 		"sec-ch-ua-mobile":   {"?0"},
 		"accept":             {"*/*"},
 		"origin":             {"https://www.pokemoncenter.com"},
@@ -331,7 +334,6 @@ func setDatadomeCookieForHost(client tls_client.HttpClient, hostURL, value strin
 	setDatadomeCookie(client, u, value)
 }
 
-// extractCookieValue parses "name=value; ..." -> "value"
 func extractCookieValue(setCookie string) string {
 	idx := strings.Index(setCookie, ";")
 	if idx == -1 {
